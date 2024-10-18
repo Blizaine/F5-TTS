@@ -4,6 +4,8 @@ import torchaudio
 import gradio as gr
 import numpy as np
 import tempfile
+import json
+import os
 from einops import rearrange
 from vocos import Vocos
 from pydub import AudioSegment, silence
@@ -127,6 +129,36 @@ def chunk_text(text, max_chars=135):
 
     return chunks
 
+def manage_audio_files(action, filename, new_name=None):
+    audio_files_path = "saved_audio_files.json"
+    if os.path.exists(audio_files_path):
+        with open(audio_files_path, "r") as f:
+            audio_files = json.load(f)
+    else:
+        audio_files = {}
+    
+    if action == "add":
+        audio_files[filename] = filename
+    elif action == "rename":
+        if filename in audio_files:
+            audio_files[new_name] = audio_files.pop(filename)
+    elif action == "delete":
+        if filename in audio_files:
+            del audio_files[filename]
+    
+    with open(audio_files_path, "w") as f:
+        json.dump(audio_files, f)
+    
+    return list(audio_files.keys())
+
+def load_saved_audio_files():
+    audio_files_path = "saved_audio_files.json"
+    if os.path.exists(audio_files_path):
+        with open(audio_files_path, "r") as f:
+            audio_files = json.load(f)
+        return list(audio_files.keys())
+    return []
+
 @gpu_decorator
 def infer_batch(ref_audio, ref_text, gen_text_batches, exp_name, remove_silence, cross_fade_duration=0.15, progress=gr.Progress()):
     if exp_name == "F5-TTS":
@@ -249,7 +281,9 @@ def infer_batch(ref_audio, ref_text, gen_text_batches, exp_name, remove_silence,
     return (target_sample_rate, final_wave), spectrogram_path
 
 @gpu_decorator
-def infer(ref_audio_orig, ref_text, gen_text, exp_name, remove_silence, cross_fade_duration=0.15):
+def infer(ref_audio_orig, ref_text, gen_text, exp_name, remove_silence, cross_fade_duration=0.15, selected_audio=None):
+    if selected_audio:
+        ref_audio_orig = f"saved_audio/{selected_audio}"
 
     print(gen_text)
 
@@ -393,7 +427,18 @@ with gr.Blocks() as app_credits:
 """)
 with gr.Blocks() as app_tts:
     gr.Markdown("# Batched TTS")
-    ref_audio_input = gr.Audio(label="Reference Audio", type="filepath")
+    audio_files = load_saved_audio_files()
+    with gr.Row():
+        with gr.Column(scale=2):
+            ref_audio_input = gr.Audio(label="Reference Audio", type="filepath")
+        with gr.Column(scale=1):
+            ref_audio_dropdown = gr.Dropdown(choices=[""] + audio_files, label="Saved Reference Audio", value="")
+            status_message = gr.Textbox(label="Status", interactive=False)
+    
+    with gr.Row():
+        save_audio_btn = gr.Button("Save Current Audio")
+        delete_audio_btn = gr.Button("Delete Selected Audio")
+    
     gen_text_input = gr.Textbox(label="Text to Generate", lines=10)
     model_choice = gr.Radio(
         choices=["F5-TTS", "E2-TTS"], label="Choose TTS Model", value="F5-TTS"
@@ -431,6 +476,76 @@ with gr.Blocks() as app_tts:
     audio_output = gr.Audio(label="Synthesized Audio")
     spectrogram_output = gr.Image(label="Spectrogram")
 
+    def load_saved_audio(audio_file):
+        if audio_file:
+            return f"saved_audio/{audio_file}"
+        return None
+
+    def save_audio(audio, is_podcast=False):
+        if audio is None:
+            return (gr.update(), gr.update(), "No audio file selected.") if is_podcast else (gr.update(), "No audio file selected.")
+        
+        try:
+            filename = os.path.basename(audio)
+            file_extension = os.path.splitext(filename)[1].lower()
+            os.makedirs("saved_audio", exist_ok=True)
+            
+            if file_extension == '.wav':
+                audio_segment = AudioSegment.from_wav(audio)
+            elif file_extension == '.mp3':
+                audio_segment = AudioSegment.from_mp3(audio)
+            else:
+                audio_segment = AudioSegment.from_file(audio)
+            
+            output_filename = f"saved_audio/{filename}"
+            audio_segment.export(output_filename, format="wav")
+            
+            updated_files = manage_audio_files("add", filename)
+            
+            if is_podcast:
+                return update_podcast_dropdowns(updated_files) + (f"Audio saved successfully as {filename}",)
+            else:
+                return update_tts_dropdown(updated_files), f"Audio saved successfully as {filename}"
+        except Exception as e:
+            error_message = f"Error saving audio: {str(e)}"
+            print(error_message)
+            return (gr.update(), gr.update(), error_message) if is_podcast else (gr.update(), error_message)
+
+    def delete_audio(filename, is_podcast=False):
+        if filename:
+            try:
+                os.remove(f"saved_audio/{filename}")
+                updated_files = manage_audio_files("delete", filename)
+                if is_podcast:
+                    return update_podcast_dropdowns(updated_files) + (f"Audio file {filename} deleted successfully",)
+                else:
+                    return update_tts_dropdown(updated_files), f"Audio file {filename} deleted successfully"
+            except Exception as e:
+                error_message = f"Error deleting audio: {str(e)}"
+                print(error_message)
+                return (gr.update(), gr.update(), error_message) if is_podcast else (gr.update(), error_message)
+        return (gr.update(), gr.update(), "Please select an audio file to delete.") if is_podcast else (gr.update(), "Please select an audio file to delete.")
+
+    # def update_dropdown():
+    #     updated_files = load_saved_audio_files()
+    #     return gr.update(choices=[""] + updated_files), gr.update(choices=[""] + updated_files)
+    def update_dropdown():
+        return load_saved_audio_files()
+
+    # Event handlers
+    ref_audio_dropdown.change(load_saved_audio, inputs=ref_audio_dropdown, outputs=ref_audio_input)
+    save_audio_btn.click(
+        save_audio,
+        inputs=[ref_audio_input],
+        outputs=[ref_audio_dropdown, status_message]
+    )
+
+    delete_audio_btn.click(
+        delete_audio,
+        inputs=[ref_audio_dropdown],
+        outputs=[ref_audio_dropdown, status_message]
+    )
+
     generate_btn.click(
         infer,
         inputs=[
@@ -440,19 +555,41 @@ with gr.Blocks() as app_tts:
             model_choice,
             remove_silence,
             cross_fade_duration_slider,
+            ref_audio_dropdown,
         ],
         outputs=[audio_output, spectrogram_output],
     )
     
+    # Update the dropdown on page load
+    # app_tts.load(update_dropdown, outputs=[ref_audio_dropdown])
+    def update_tts_dropdown(file_list):
+        return gr.update(choices=[""] + file_list)
+
+    app_tts.load(lambda: update_tts_dropdown(update_dropdown()), outputs=[ref_audio_dropdown])
 with gr.Blocks() as app_podcast:
     gr.Markdown("# Podcast Generation")
     speaker1_name = gr.Textbox(label="Speaker 1 Name")
-    ref_audio_input1 = gr.Audio(label="Reference Audio (Speaker 1)", type="filepath")
+    with gr.Row():
+        with gr.Column(scale=2):
+            ref_audio_input1 = gr.Audio(label="Reference Audio (Speaker 1)", type="filepath")
+        with gr.Column(scale=1):
+            ref_audio_dropdown1 = gr.Dropdown(choices=[""] + audio_files, label="Saved Reference Audio (Speaker 1)", value="")
+            save_audio_btn1 = gr.Button("Save Speaker 1 Audio")
     ref_text_input1 = gr.Textbox(label="Reference Text (Speaker 1)", lines=2)
     
     speaker2_name = gr.Textbox(label="Speaker 2 Name")
-    ref_audio_input2 = gr.Audio(label="Reference Audio (Speaker 2)", type="filepath")
+    with gr.Row():
+        with gr.Column(scale=2):
+            ref_audio_input2 = gr.Audio(label="Reference Audio (Speaker 2)", type="filepath")
+        with gr.Column(scale=1):
+            ref_audio_dropdown2 = gr.Dropdown(choices=[""] + audio_files, label="Saved Reference Audio (Speaker 2)", value="")
+            save_audio_btn2 = gr.Button("Save Speaker 2 Audio")
     ref_text_input2 = gr.Textbox(label="Reference Text (Speaker 2)", lines=2)
+    
+    # with gr.Row():
+        # save_audio_btn1 = gr.Button("Save Speaker 1 Audio")
+        # save_audio_btn2 = gr.Button("Save Speaker 2 Audio")
+        # delete_audio_btn = gr.Button("Delete Selected Audio")
     
     script_input = gr.Textbox(label="Podcast Script", lines=10, 
                                 placeholder="Enter the script with speaker names at the start of each block, e.g.:\nSean: How did you start studying...\n\nMeghan: I came to my interest in technology...\nIt was a long journey...\n\nSean: That's fascinating. Can you elaborate...")
@@ -467,6 +604,27 @@ with gr.Blocks() as app_podcast:
     generate_podcast_btn = gr.Button("Generate Podcast", variant="primary")
     podcast_output = gr.Audio(label="Generated Podcast")
 
+    # Event handlers for the new UI elements
+    ref_audio_dropdown1.change(load_saved_audio, inputs=ref_audio_dropdown1, outputs=ref_audio_input1)
+    ref_audio_dropdown2.change(load_saved_audio, inputs=ref_audio_dropdown2, outputs=ref_audio_input2)
+    
+    save_audio_btn1.click(
+        lambda x: save_audio(x, is_podcast=True),
+        inputs=[ref_audio_input1],
+        outputs=[ref_audio_dropdown1, ref_audio_dropdown2, status_message]
+    )
+
+    save_audio_btn2.click(
+        lambda x: save_audio(x, is_podcast=True),
+        inputs=[ref_audio_input2],
+        outputs=[ref_audio_dropdown1, ref_audio_dropdown2, status_message]
+    )
+
+    # delete_audio_btn.click(
+    #     lambda x: delete_audio(x, is_podcast=True),
+    #     inputs=[ref_audio_dropdown1],
+    #     outputs=[ref_audio_dropdown1, ref_audio_dropdown2, status_message]
+    # )
     def podcast_generation(script, speaker1, ref_audio1, ref_text1, speaker2, ref_audio2, ref_text2, model, remove_silence):
         return generate_podcast(script, speaker1, ref_audio1, ref_text1, speaker2, ref_audio2, ref_text2, model, remove_silence)
 
@@ -485,6 +643,13 @@ with gr.Blocks() as app_podcast:
         ],
         outputs=podcast_output,
     )
+
+    # Update the dropdowns on page load
+    #  app_podcast.load(update_dropdown, outputs=[ref_audio_dropdown1, ref_audio_dropdown2])
+    def update_podcast_dropdowns(file_list):
+        return gr.update(choices=[""] + file_list), gr.update(choices=[""] + file_list)
+
+    app_podcast.load(lambda: update_podcast_dropdowns(update_dropdown()), outputs=[ref_audio_dropdown1, ref_audio_dropdown2])    
 
 def parse_emotional_text(gen_text):
     # Pattern to find (Emotion)
